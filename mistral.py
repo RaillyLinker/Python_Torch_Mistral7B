@@ -50,8 +50,8 @@ class RotaryEmbedding(nn.Module):
         return self.cos[:, :, :seq_len, :], self.sin[:, :, :seq_len, :]
 
 
-class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, num_heads, num_kv_heads, dropout=0.0):
+class GqaAndSwa(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_heads, window_size, dropout=0.0):
         super().__init__()
         assert d_model % num_heads == 0
         assert d_model % num_kv_heads == 0
@@ -67,18 +67,27 @@ class GroupedQueryAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.rotary_emb = RotaryEmbedding(self.head_dim)
+        self.window_size = window_size  # sliding window size
+
+    def _make_sliding_window_mask(self, seq_len, device):
+        # causal mask with sliding window constraint
+        mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
+        for i in range(seq_len):
+            start = max(0, i - self.window_size + 1)
+            mask[i, start:i + 1] = 0  # allow attention within window
+        return mask  # (seq_len, seq_len)
 
     def forward(self, x, mask=None):
         batch_size, seq_len, _ = x.size()
 
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = q.permute(0, 2, 1, 3)
+        q = q.permute(0, 2, 1, 3)  # (B, num_heads, seq_len, head_dim)
 
         k = self.k_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.kv_head_dim)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.kv_head_dim)
         group_size = self.num_heads // self.num_kv_heads
 
-        k = k.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)  # (B, num_kv_heads, seq_len, kv_head_dim)
         v = v.permute(0, 2, 1, 3)
 
         k = k.view(batch_size, self.num_kv_heads, seq_len, group_size, self.head_dim)
@@ -90,14 +99,22 @@ class GroupedQueryAttention(nn.Module):
         cos, sin = self.rotary_emb(seq_len)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, num_heads, seq_len, seq_len)
+
+        sliding_mask = self._make_sliding_window_mask(seq_len, x.device)  # (seq_len, seq_len)
+        sliding_mask = sliding_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
 
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            # Combine user mask and sliding window mask: zero = allowed, -inf = masked
+            combined_mask = torch.maximum(mask.float(), sliding_mask)
+        else:
+            combined_mask = sliding_mask
+
+        scores = scores + combined_mask  # add mask before softmax
 
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn, v)  # (B, num_heads, seq_len, head_dim)
 
         out = out.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, self.d_model)
         return self.out_proj(out)
@@ -151,16 +168,15 @@ class PositionwiseFeedForward(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, hidden_dim, window_size=4096, dropout=0.1):
         super().__init__()
-        self.attn = GroupedQueryAttention(dim, num_heads, num_kv_heads, dropout)
+        self.attn = GqaAndSwa(dim, num_heads, num_kv_heads, window_size, dropout)
         self.ff = PositionwiseFeedForward(dim, hidden_dim, dropout)
-        self.window_size = window_size
         self.sublayers = nn.ModuleList([
             SublayerConnection(dim, 0.0),
             SublayerConnection(dim, 0.0)
         ])
 
-    def forward(self, x, mask=None):
-        x = self.sublayers[0](x, lambda _x: self.attn(_x, mask))
+    def forward(self, x):
+        x = self.sublayers[0](x, lambda _x: self.attn(_x))
         x = self.sublayers[1](x, self.ff)
         return x
 
@@ -194,13 +210,10 @@ class Mistral7B(nn.Module):
         if seq_len > self.max_len:
             raise ValueError(f"Sequence length {seq_len} exceeds max length {self.max_len}")
 
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device)).bool()
-        mask = mask.unsqueeze(0).unsqueeze(0)
-
         x = self.embed(x)
 
         for layer in self.layers:
-            x = layer(x, mask=mask)
+            x = layer(x)
 
         x = self.norm(x)
         logits = self.head(x)
