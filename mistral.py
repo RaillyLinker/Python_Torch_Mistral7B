@@ -30,28 +30,26 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin):
+def build_rotary_pos_emb(dim, max_seq_len=2048):
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_seq_len).float()
+    freqs = torch.einsum('i , j -> i j', t, inv_freq)  # (max_seq_len, dim/2)
+    emb = torch.cat((freqs, freqs), dim=-1)  # (max_seq_len, dim)
+    cos = emb.cos()[None, None, :, :]  # (1, 1, max_seq_len, dim)
+    sin = emb.sin()[None, None, :, :]
+    return cos, sin
+
+
+def apply_rotary_pos_emb_single(q, k, cos, sin, seq_len):
+    cos = cos[:, :, :seq_len, :]
+    sin = sin[:, :, :seq_len, :]
     q_ = (q * cos) + (rotate_half(q) * sin)
     k_ = (k * cos) + (rotate_half(k) * sin)
     return q_, k_
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=2048):
-        super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_seq_len).float()
-        freqs = torch.einsum('i , j -> i j', t, inv_freq)  # (max_seq_len, dim/2)
-        emb = torch.cat((freqs, freqs), dim=-1)  # (max_seq_len, dim)
-        self.register_buffer('cos', emb.cos()[None, None, :, :])  # (1,1,max_seq_len, dim)
-        self.register_buffer('sin', emb.sin()[None, None, :, :])
-
-    def forward(self, seq_len):
-        return self.cos[:, :, :seq_len, :], self.sin[:, :, :seq_len, :]
-
-
 class GqaAndSwa(nn.Module):
-    def __init__(self, d_model, num_heads, num_kv_heads, window_size, dropout=0.0):
+    def __init__(self, d_model, num_heads, num_kv_heads, window_size, dropout=0.0, max_seq_len=2048):
         super().__init__()
         assert d_model % num_heads == 0
         assert d_model % num_kv_heads == 0
@@ -66,28 +64,30 @@ class GqaAndSwa(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
-        self.rotary_emb = RotaryEmbedding(self.head_dim)
-        self.window_size = window_size  # sliding window size
+        self.window_size = window_size
+
+        cos, sin = build_rotary_pos_emb(self.head_dim, max_seq_len)
+        self.register_buffer('cos', cos)
+        self.register_buffer('sin', sin)
 
     def _make_sliding_window_mask(self, seq_len, device):
-        # causal mask with sliding window constraint
         mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
         for i in range(seq_len):
             start = max(0, i - self.window_size + 1)
-            mask[i, start:i + 1] = 0  # allow attention within window
-        return mask  # (seq_len, seq_len)
+            mask[i, start:i + 1] = 0
+        return mask
 
     def forward(self, x, mask=None):
         batch_size, seq_len, _ = x.size()
 
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = q.permute(0, 2, 1, 3)  # (B, num_heads, seq_len, head_dim)
+        q = q.permute(0, 2, 1, 3)
 
         k = self.k_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.kv_head_dim)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.kv_head_dim)
         group_size = self.num_heads // self.num_kv_heads
 
-        k = k.permute(0, 2, 1, 3)  # (B, num_kv_heads, seq_len, kv_head_dim)
+        k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
         k = k.view(batch_size, self.num_kv_heads, seq_len, group_size, self.head_dim)
@@ -96,25 +96,23 @@ class GqaAndSwa(nn.Module):
         k = k.permute(0, 1, 3, 2, 4).contiguous().view(batch_size, self.num_heads, seq_len, self.head_dim)
         v = v.permute(0, 1, 3, 2, 4).contiguous().view(batch_size, self.num_heads, seq_len, self.head_dim)
 
-        cos, sin = self.rotary_emb(seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_pos_emb_single(q, k, self.cos, self.sin, seq_len)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, num_heads, seq_len, seq_len)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        sliding_mask = self._make_sliding_window_mask(seq_len, x.device)  # (seq_len, seq_len)
-        sliding_mask = sliding_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+        sliding_mask = self._make_sliding_window_mask(seq_len, x.device)
+        sliding_mask = sliding_mask.unsqueeze(0).unsqueeze(0)
 
         if mask is not None:
-            # Combine user mask and sliding window mask: zero = allowed, -inf = masked
             combined_mask = torch.maximum(mask.float(), sliding_mask)
         else:
             combined_mask = sliding_mask
 
-        scores = scores + combined_mask  # add mask before softmax
+        scores = scores + combined_mask
 
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
-        out = torch.matmul(attn, v)  # (B, num_heads, seq_len, head_dim)
+        out = torch.matmul(attn, v)
 
         out = out.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, self.d_model)
         return self.out_proj(out)
